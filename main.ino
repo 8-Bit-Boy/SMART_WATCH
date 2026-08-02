@@ -11,9 +11,11 @@
 #include <SPI.h>
 #endif
 
+#include <esp_sleep.h>
+
 //your networks name and password
-const char* ssid = "YourWiFi";
-const char* password = "YourPassword";
+const char* ssid = "";
+const char* password = "";
 
 //defining SPI pins for OLED display
 U8X8_SH1106_128X64_NONAME_4W_SW_SPI u8x8(
@@ -23,6 +25,9 @@ U8X8_SH1106_128X64_NONAME_4W_SW_SPI u8x8(
     /* dc=*/5,
     /* reset=*/4
 );
+
+const char error_name[] = "Wifi"; 
+const char error_definition[] = "Failed"; 
 
 //holds weather data
 struct Weather
@@ -53,7 +58,17 @@ unsigned long startTime = 0;
 unsigned long elapsedTime = 0;
 bool isRunning = false;
 
-
+//battery pins 
+const int battery_pin = 11;
+float voltage  = 0.0;
+float ADC_value = 0;
+float ADC_max_voltage = 3.3;      //max ADC input voltage 
+float op_voltage = 3.2;         //smallest safe  possible operating voltage 
+float  blackout_voltage = 3.0;  //below this voltage ,  the device should turn off
+int battery_flash_delay = 200;  //delay between LED flashes to indicate LOW battery 
+float  ADC_range = 4095.0f;     //Esp C3 has a 12 bit ADC 
+float V_divider_factor = 2;     //factor to account for voltage division
+bool batteryLow = false;
 
 /*
 function declarations
@@ -68,6 +83,8 @@ void stop_watch_state();
 void weather_state();
 void timer();
 String weatherText(int code);
+float  monitor_battery();
+void Low_battery_flash();
 
 
 /*
@@ -96,27 +113,24 @@ void IRAM_ATTR option_select(){
 */
 
 
-
-
 void setup() {
   // put your setup code here, to run once:
+    //setting the BAUD rate 
+    Serial.begin(115200);
+    
+    // Serial.println("In setup");              //debugging line 
+
     //ISR pin configurations
     pinMode(state_button  , INPUT_PULLUP);
     attachInterrupt(state_button   , state_select, RISING);
 
     pinMode(select_button  , INPUT_PULLUP);
     attachInterrupt(select_button   , option_select, RISING);
-
-    //setting the BAUD rate 
-    Serial.begin(115200);
-
     
     u8x8.begin();
     u8x8.setPowerSave(0);
 
-
-    //date and time configuration
-    WiFi.begin(ssid, password);
+    WiFi.begin(ssid , password);
 
     unsigned long start = millis();
 
@@ -124,7 +138,8 @@ void setup() {
     {
         if(millis()-start > 15000)          //exits error code after 15s 
         {
-            displayError("WiFi","Failed");
+            Serial.println("Wifi error!");
+            displayError(error_name , error_definition);
             break;
         }
 
@@ -138,6 +153,10 @@ void setup() {
 
 void loop() {
   // put your main code here, to run repeatedly:
+
+// Low_battery_flash();
+Serial.println("In the loop");
+
 switch(state_counter)
 {
     case 0:
@@ -201,15 +220,17 @@ void displayError(const char *title, const char *message)
     u8x8.clearDisplay();
 
     // Error title (inverse text)
-    u8x8.setInverseFont(1);
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
     u8x8.drawString(0, 0, title);
-    u8x8.setInverseFont(0);
 
     // Message
-    u8x8.setFont(u8x8_font_chroma48medium8_r);
-    u8x8.drawString(0, 2, message);
+    // u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.setInverseFont(1);
+    u8x8.drawString(0, 1, message);
+    u8x8.setInverseFont(0);
 
     u8x8.refreshDisplay();
+
 }
 
    //determing the weeather forecast using the weather_code
@@ -381,6 +402,63 @@ getWeather();
 void stop_watch_state(){
 timer();
 }
+
+
+/*
+*********************************************************************************
+Power management functions functions 
+*/
+
+
+
+float monitor_battery(){
+    //read voltage of the battery 
+    ADC_value = analogRead(battery_pin);
+    //convert to voltage 
+    voltage = (ADC_value/ADC_range)*(ADC_max_voltage);
+
+    if(voltage >= op_voltage){
+        u8x8.setPowerSave(0);
+        return voltage;
+        
+    }else if(voltage > blackout_voltage) {
+
+        //flash LED to indicate reduced battery voltage 
+        ::batteryLow = true;
+        return voltage;
+        
+    }else {
+        u8x8.clearDisplay();
+        u8x8.drawString(0, 3, "LOW BATTERY");
+
+        delay(3000);
+
+        u8x8.setPowerSave(1);
+
+        // Sleep until the user charges the watch or presses a button
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 1);
+        esp_deep_sleep_start();
+    }
+}
+
+void Low_battery_flash(){
+    if(batteryLow){
+    digitalWrite(BUILTIN_LED, HIGH); 
+    delay(battery_flash_delay);
+
+    digitalWrite(BUILTIN_LED, LOW); 
+    delay(battery_flash_delay);
+    
+    digitalWrite(BUILTIN_LED, HIGH); 
+    delay(battery_flash_delay);
+    
+    digitalWrite(BUILTIN_LED, LOW); 
+    delay(battery_flash_delay);
+    }else {
+        return;
+    }
+}
+
 
 
 /*
