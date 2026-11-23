@@ -13,6 +13,14 @@
 
 #include <esp_sleep.h>
 
+//MPU-6050
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+Adafruit_MPU6050 mpu;
+bool mpu_ok = false;
+
 //your networks name and password
 const char* ssid = "";
 const char* password = "";
@@ -48,7 +56,7 @@ volatile int state_counter = 0;
 volatile bool selected = false;
 //the number of states 
 //start counting from 0
-const int max_no_of_states = 3; 
+const int max_no_of_states = 2;         // = no. of states - 1
 
 //struct to hold time data;
 struct tm timeinfo;
@@ -57,9 +65,10 @@ struct tm timeinfo;
 unsigned long startTime = 0;
 unsigned long elapsedTime = 0;
 bool isRunning = false;
+unsigned long counter = 0;
 
 //battery pins 
-const int battery_pin = 11;
+const int battery_pin = 1;
 float voltage  = 0.0;
 float ADC_value = 0;
 float ADC_max_voltage = 3.3;      //max ADC input voltage 
@@ -67,8 +76,12 @@ float op_voltage = 3.2;         //smallest safe  possible operating voltage
 float  blackout_voltage = 3.0;  //below this voltage ,  the device should turn off
 int battery_flash_delay = 200;  //delay between LED flashes to indicate LOW battery 
 float  ADC_range = 4095.0f;     //Esp C3 has a 12 bit ADC 
-float V_divider_factor = 2;     //factor to account for voltage division
+float V_divider_factor = 73.0f / 50.0f  ;
 bool batteryLow = false;
+
+//Determines the time between window refreshes 
+//Smaller delay creates smoother windows
+const int Refresh_rate = 2;
 
 /*
 function declarations
@@ -85,6 +98,7 @@ void timer();
 String weatherText(int code);
 float  monitor_battery();
 void Low_battery_flash();
+void read_mpu();
 
 
 /*
@@ -100,12 +114,17 @@ void IRAM_ATTR state_select(){
 
     if(state_counter > max_no_of_states)
         state_counter = 0;
+
+    //clear flags when transitioning states 
+    //for the alarm state
+    isRunning  = false;
+    selected  = false;
 }
 
 //select button ISR 
 //triggered when an menu option is selected 
 void IRAM_ATTR option_select(){
-  selected = true;     
+  selected = true;          
 }
 
 /*
@@ -129,6 +148,17 @@ void setup() {
     
     u8x8.begin();
     u8x8.setPowerSave(0);
+
+    //MPU-setup 
+    Wire.begin(8, 7);   // SDA = GPIO 8, SCL = GPIO 7
+    mpu_ok = mpu.begin(0x68, &Wire);
+
+    if (mpu_ok)
+    {
+        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
 
     WiFi.begin(ssid , password);
 
@@ -155,7 +185,8 @@ void loop() {
   // put your main code here, to run repeatedly:
 
 // Low_battery_flash();
-Serial.println("In the loop");
+//Debugging line
+// Serial.println("In the loop");
 
 switch(state_counter)
 {
@@ -173,10 +204,9 @@ switch(state_counter)
         break;
 }
 
-delay(200);
+delay(Refresh_rate);
 
 }
-
 
 
 /*  
@@ -295,6 +325,14 @@ Weather getWeather()
     {
         displayError("Weather","No Internet");
         http.end();
+        //displaying the battery percentage even when  no internet 
+        float batt_percent = ((monitor_battery() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
+        batt_percent = constrain(batt_percent, 0.0f, 100.0f);   // clamp so it never shows over 100%
+
+        char batt[20];
+        sprintf(batt, "Bat %.0f%%", batt_percent);
+
+        u8x8.drawString(0, 6, batt);
         return weather;
     }
 
@@ -342,40 +380,83 @@ Weather getWeather()
     u8x8.drawString(0,2,hum);
     u8x8.drawString(0,4,forecast);
 
+    //displaying the battery percentage
+    float batt_percent = ((monitor_battery() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
+    batt_percent = constrain(batt_percent, 0.0f, 100.0f);   // clamp so it never shows over 100%
+
+    char batt[20];
+    sprintf(batt, "Bat %.0f%%", batt_percent);
+
+    u8x8.drawString(0, 6, batt);
+
     return weather;
 }
 
 
-
 void timer(){
 
-        char stop_time[20]; 
+    char time[20]; 
 
     if (selected == true &&  isRunning == false){
         isRunning = true;       //start the timer 
         startTime = millis();   //save the current time
-        selected = false;       
+        selected = false;       //clear select flag   
 
     }else if(selected == false &&  isRunning == true){
-        //display the the time  
-        sprintf(stop_time,"%lu s", millis()/1000);
+        //display the the time as it counts 
+        counter  = millis()/1000;           //save current time(s)
+        sprintf(time,"%lu s", counter);
 
         u8x8.clearDisplay();
-        u8x8.drawString(0,0,stop_time);
+        u8x8.drawString(0,0,time);
 
     }else if(selected == true && isRunning == true){
-        elapsedTime = millis() - startTime;         //record how much time has passed
+        elapsedTime = counter - startTime/1000;         //record how much time has passed(s)
 
-        sprintf(stop_time,"%lu s", elapsedTime/1000);
+        sprintf(time,"%lu s", elapsedTime);
 
         u8x8.clearDisplay();
-        u8x8.drawString(0,0,stop_time);
+        u8x8.drawString(0,0,time);
 
     }else{
-
+        //Displays zero in case where both are false 
         u8x8.clearDisplay();
-        u8x8.drawString(0,0,"0");
+        u8x8.drawString(0,0,"0");   
     }
+}
+
+//the MPU functino below goes in the stopwatch state
+//reads the MPU6050 and displays it under the stopwatch time
+void read_mpu()
+{
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+
+    if (!mpu_ok)
+    {
+        u8x8.drawString(0, 2, "MPU not found");
+        return;
+    }
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    char line[17];
+
+    // Acceleration (m/s^2)
+    snprintf(line, sizeof(line), "AX %6.2f", a.acceleration.x);
+    u8x8.drawString(0, 2, line);
+    snprintf(line, sizeof(line), "AY %6.2f", a.acceleration.y);
+    u8x8.drawString(0, 3, line);
+    snprintf(line, sizeof(line), "AZ %6.2f", a.acceleration.z);
+    u8x8.drawString(0, 4, line);
+
+    // Rotation (rad/s)
+    snprintf(line, sizeof(line), "GX %6.2f", g.gyro.x);
+    u8x8.drawString(0, 5, line);
+    snprintf(line, sizeof(line), "GY %6.2f", g.gyro.y);
+    u8x8.drawString(0, 6, line);
+    snprintf(line, sizeof(line), "GZ %6.2f", g.gyro.z);
+    u8x8.drawString(0, 7, line);
 }
 
 /*
@@ -401,6 +482,7 @@ getWeather();
 //function to implement stopwatch 
 void stop_watch_state(){
 timer();
+    read_mpu();
 }
 
 
@@ -415,7 +497,7 @@ float monitor_battery(){
     //read voltage of the battery 
     ADC_value = analogRead(battery_pin);
     //convert to voltage 
-    voltage = (ADC_value/ADC_range)*(ADC_max_voltage);
+    ::voltage = ((ADC_value/ADC_range)*(ADC_max_voltage))*V_divider_factor;
 
     if(voltage >= op_voltage){
         u8x8.setPowerSave(0);
@@ -424,9 +506,10 @@ float monitor_battery(){
     }else if(voltage > blackout_voltage) {
 
         //flash LED to indicate reduced battery voltage 
+        Low_battery_flash();
         ::batteryLow = true;
         return voltage;
-        
+
     }else {
         u8x8.clearDisplay();
         u8x8.drawString(0, 3, "LOW BATTERY");
@@ -436,13 +519,15 @@ float monitor_battery(){
         u8x8.setPowerSave(1);
 
         // Sleep until the user charges the watch or presses a button
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 1);
-        esp_deep_sleep_start();
+        // esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 1);
+        // esp_deep_sleep_start();
+        return voltage;
     }
 }
 
 void Low_battery_flash(){
     if(batteryLow){
+    //flash the LED 
     digitalWrite(BUILTIN_LED, HIGH); 
     delay(battery_flash_delay);
 
@@ -454,12 +539,11 @@ void Low_battery_flash(){
     
     digitalWrite(BUILTIN_LED, LOW); 
     delay(battery_flash_delay);
+    
     }else {
         return;
     }
 }
-
-
 
 /*
 *********************************************************************************
