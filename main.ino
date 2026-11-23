@@ -2,6 +2,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
+#include <NimBLEDevice.h>   
 #include <time.h>
 
 #include <Arduino.h>
@@ -79,9 +80,55 @@ float  ADC_range = 4095.0f;     //Esp C3 has a 12 bit ADC
 float V_divider_factor = 73.0f / 50.0f  ;
 bool batteryLow = false;
 
+const unsigned long WEATHER_INTERVAL = 60UL * 60UL * 1000UL;   // 1 hour
+const unsigned long WEATHER_RETRY    = 60UL * 1000UL;          // retry after 1 min on failure
+
+unsigned long lastWeatherFetch = 0;
+unsigned long weatherWait = 0;       // how long to wait before the next fetch
+bool weatherFetchedOnce = false;
+bool weatherOK = false;
+
 //Determines the time between window refreshes 
 //Smaller delay creates smoother windows
 const int Refresh_rate = 2;
+
+//BLE defintions 
+#define SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
+#define MPU_UUID     "12345678-1234-5678-1234-56789abcdef2"
+#define BATT_UUID    "12345678-1234-5678-1234-56789abcdef3"
+
+NimBLEServer*         pServer      = nullptr;
+NimBLECharacteristic* pMpuChar  = nullptr;
+NimBLECharacteristic* pBattChar = nullptr;
+
+unsigned long lastMpuSend  = 0;
+unsigned long lastBattSend = 0;
+
+// latest MPU reading, shared by the screen and BLE
+struct MpuData { float ax, ay, az, gx, gy, gz; };
+MpuData mpuData = {0, 0, 0, 0, 0, 0};
+bool mpuFresh = false;          // true when there is a reading not yet sent
+unsigned long lastMpuRead = 0;
+//tells us if a device connected to the wacth 
+volatile bool         bleConnected = false;
+unsigned long         lastBleSend  = 0;
+//counter is a variable used in testing, remove for final run
+uint32_t              bleCounter   = 0;
+
+//class with functions that decide what to do when a device connects or disconnects 
+//overide tells the compiler that we will be changing the libraries defualt version
+//of that function 
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
+        bleConnected = true;
+    }
+    void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
+        bleConnected = false;
+        NimBLEDevice::getAdvertising()->start();   // become discoverable again
+    }
+};
+
+
 
 /*
 function declarations
@@ -91,7 +138,8 @@ function declarations
 void time_state();
 tm get_date_time();
 void displayError(const char *title, const char *message);
-Weather getWeather();
+bool fetch_weather();
+void display_weather();
 void stop_watch_state();
 void weather_state();
 void timer();
@@ -99,7 +147,47 @@ String weatherText(int code);
 float  monitor_battery();
 void Low_battery_flash();
 void read_mpu();
+void drawPadded(uint8_t row, const char *text);
+void clearShown();
+void state_changed();
+void ble_send();
+void ble_setup();
+void update_mpu();
+float read_battery_voltage();
+uint8_t battery_percent();
 
+char shown[8][17];            // what is currently on each of the 8 rows
+int  last_drawn_state = -1;
+int  lastSecondDrawn  = -1;
+
+// writes a row padded to 16 chars, and only if the text actually changed
+void drawPadded(uint8_t row, const char *text)
+{
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%-16s", text);
+
+    if (strcmp(buf, shown[row]) == 0) return;   // unchanged, skip the SPI traffic
+    strcpy(shown[row], buf);
+
+    u8x8.drawString(0, row, buf);
+}
+
+void clearShown()
+{
+    memset(shown, 0, sizeof(shown));
+}
+
+// clears the screen once when the state changes
+void state_changed()
+{
+    int s = state_counter;
+    if (s == last_drawn_state) return;
+
+    last_drawn_state = s;
+    lastSecondDrawn  = -1;      // force the clock to redraw
+    u8x8.clearDisplay();
+    clearShown();
+}
 
 /*
 ISR's
@@ -177,16 +265,16 @@ void setup() {
     }
 
     configTime(2 * 3600, 0, "pool.ntp.org");   // UTC+2 for South Africa
-
+    //setting up BLE 
+    ble_setup();
 }
   
 
 void loop() {
   // put your main code here, to run repeatedly:
 
-// Low_battery_flash();
-//Debugging line
-// Serial.println("In the loop");
+update_mpu();
+ble_send();
 
 switch(state_counter)
 {
@@ -216,29 +304,22 @@ delay(Refresh_rate);
 //function to get the  time over wifi and display to the OLED 
 tm get_date_time()
 {
-    if (getLocalTime(&timeinfo))
+    if (getLocalTime(&timeinfo) && timeinfo.tm_sec != lastSecondDrawn)
     {
-        char timeString[9];   // HH:MM:SS
-        char dateString[20];  // Sat 19 Jul
+        lastSecondDrawn = timeinfo.tm_sec;
+
+        char timeString[9];
+        char dateString[20];
 
         sprintf(timeString, "%02d:%02d:%02d",
-                timeinfo.tm_hour,
-                timeinfo.tm_min,
-                timeinfo.tm_sec);
-
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         strftime(dateString, sizeof(dateString), "%a %d %b", &timeinfo);
 
-        u8x8.clearDisplay();
-
-        // Large time
         u8x8.setFont(u8x8_font_inr21_2x4_r);
         u8x8.drawString(1, 0, timeString);
 
-        // Date
         u8x8.setFont(u8x8_font_chroma48medium8_r);
         u8x8.drawString(2, 6, dateString);
-
-        u8x8.refreshDisplay();
     }
 
     return timeinfo;
@@ -302,9 +383,23 @@ void displayError(const char *title, const char *message)
 
 
 //function to get current weather coinditions and display them
-Weather getWeather()
+//change the location via longitude and latitude whif you change cities or something
+//only talks to the API, no drawing
+bool fetch_weather()
 {
+    //reconnecting to network
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        WiFi.reconnect();
 
+        // give it a few seconds to come back
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 5000)
+            delay(100);
+
+        if (WiFi.status() != WL_CONNECTED)
+            return false;
+    }
 
     HTTPClient http;
 
@@ -318,147 +413,122 @@ Weather getWeather()
     "weather_code";
 
     http.begin(url);
-
     int httpCode = http.GET();
-    //error check 
-    if(httpCode != HTTP_CODE_OK)
+
+    if (httpCode != HTTP_CODE_OK)
     {
-        displayError("Weather","No Internet");
         http.end();
-        //displaying the battery percentage even when  no internet 
-        float batt_percent = ((monitor_battery() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
-        batt_percent = constrain(batt_percent, 0.0f, 100.0f);   // clamp so it never shows over 100%
-
-        char batt[20];
-        sprintf(batt, "Bat %.0f%%", batt_percent);
-
-        u8x8.drawString(0, 6, batt);
-        return weather;
+        return false;
     }
 
-    if (httpCode == 200)
-    {
-        String payload = http.getString();
-
-        JsonDocument doc;
-
-        DeserializationError err = deserializeJson(doc, payload);
-    //error check the json payload
-    if(err)
-        {
-            displayError("JSON Error", err.c_str());
-            http.end();
-            return weather;
-        }
-
-        weather.temperature =
-            doc["current"]["temperature_2m"];
-
-        weather.humidity =
-            doc["current"]["relative_humidity_2m"];
-
-        weather.pressure =
-            doc["current"]["pressure_msl"];
-
-        weather.weatherCode =
-            doc["current"]["weather_code"];
-    }
-
+    String payload = http.getString();
     http.end();
 
+    JsonDocument doc;
+    if (deserializeJson(doc, payload))
+        return false;
 
-    char temp[20];
-    char hum[20];
-    char forecast[20];
+    weather.temperature = doc["current"]["temperature_2m"];
+    weather.humidity    = doc["current"]["relative_humidity_2m"];
+    weather.pressure    = doc["current"]["pressure_msl"];
+    weather.weatherCode = doc["current"]["weather_code"];
 
-    sprintf(temp, "%.1f C", weather.temperature);
-    sprintf(hum, "Hum %d%%", weather.humidity);
-    sprintf(forecast, "%s", weatherText(weather.weatherCode).c_str());
+    return true;
+}
 
-    u8x8.clearDisplay();
-    u8x8.drawString(0,0,temp);
-    u8x8.drawString(0,2,hum);
-    u8x8.drawString(0,4,forecast);
+//draws the stored weather data plus battery, no network
+void display_weather()
+{
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
 
-    //displaying the battery percentage
+    if (!weatherOK)
+    {
+        drawPadded(0, "No weather");
+        drawPadded(2, "data yet");
+    }
+    else
+    {
+        char line[17];
+
+        snprintf(line, sizeof(line), "%.1f C", weather.temperature);
+        drawPadded(0, line);
+
+        snprintf(line, sizeof(line), "Hum %d%%", weather.humidity);
+        drawPadded(2, line);
+
+        drawPadded(4, weatherText(weather.weatherCode).c_str());
+    }
+
     float batt_percent = ((monitor_battery() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
-    batt_percent = constrain(batt_percent, 0.0f, 100.0f);   // clamp so it never shows over 100%
+    batt_percent = constrain(batt_percent, 0.0f, 100.0f);
 
-    char batt[20];
-    sprintf(batt, "Bat %.0f%%", batt_percent);
-
-    u8x8.drawString(0, 6, batt);
-
-    return weather;
+    char batt[17];
+    snprintf(batt, sizeof(batt), "Bat %.0f%%", batt_percent);
+    drawPadded(6, batt);
 }
 
 
 void timer(){
+    char buf[17];
 
-    char time[20]; 
-
-    if (selected == true &&  isRunning == false){
-        isRunning = true;       //start the timer 
-        startTime = millis();   //save the current time
-        selected = false;       //clear select flag   
-
-    }else if(selected == false &&  isRunning == true){
-        //display the the time as it counts 
-        counter  = millis()/1000;           //save current time(s)
-        sprintf(time,"%lu s", counter);
-
-        u8x8.clearDisplay();
-        u8x8.drawString(0,0,time);
-
-    }else if(selected == true && isRunning == true){
-        elapsedTime = counter - startTime/1000;         //record how much time has passed(s)
-
-        sprintf(time,"%lu s", elapsedTime);
-
-        u8x8.clearDisplay();
-        u8x8.drawString(0,0,time);
-
-    }else{
-        //Displays zero in case where both are false 
-        u8x8.clearDisplay();
-        u8x8.drawString(0,0,"0");   
+    if (selected && !isRunning){
+        isRunning = true;
+        startTime = millis();
+        selected  = false;
+    }
+    else if (!selected && isRunning){
+        counter = (millis() - startTime) / 1000;     // seconds since start
+        snprintf(buf, sizeof(buf), "%lu s", counter);
+        drawPadded(0, buf);
+    }
+    else if (selected && isRunning){
+        // stopped: keep showing the last value
+        snprintf(buf, sizeof(buf), "%lu s", counter);
+        drawPadded(0, buf);
+    }
+    else{
+        drawPadded(0, "0 s");
     }
 }
 
-//the MPU functino below goes in the stopwatch state
-//reads the MPU6050 and displays it under the stopwatch time
-void read_mpu()
-{
-    u8x8.setFont(u8x8_font_chroma48medium8_r);
 
-    if (!mpu_ok)
-    {
-        u8x8.drawString(0, 2, "MPU not found");
-        return;
-    }
+//the MPU functino below goes in the stopwatch state
+// reads the sensor into mpuData, called every loop, throttled to 10 Hz
+void update_mpu()
+{
+    if (!mpu_ok) return;
+    if (millis() - lastMpuRead < 100) return;
+    lastMpuRead = millis();
 
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
-    char line[17];
-
-    // Acceleration (m/s^2)
-    snprintf(line, sizeof(line), "AX %6.2f", a.acceleration.x);
-    u8x8.drawString(0, 2, line);
-    snprintf(line, sizeof(line), "AY %6.2f", a.acceleration.y);
-    u8x8.drawString(0, 3, line);
-    snprintf(line, sizeof(line), "AZ %6.2f", a.acceleration.z);
-    u8x8.drawString(0, 4, line);
-
-    // Rotation (rad/s)
-    snprintf(line, sizeof(line), "GX %6.2f", g.gyro.x);
-    u8x8.drawString(0, 5, line);
-    snprintf(line, sizeof(line), "GY %6.2f", g.gyro.y);
-    u8x8.drawString(0, 6, line);
-    snprintf(line, sizeof(line), "GZ %6.2f", g.gyro.z);
-    u8x8.drawString(0, 7, line);
+    mpuData.ax = a.acceleration.x;
+    mpuData.ay = a.acceleration.y;
+    mpuData.az = a.acceleration.z;
+    mpuData.gx = g.gyro.x;
+    mpuData.gy = g.gyro.y;
+    mpuData.gz = g.gyro.z;
+    mpuFresh = true;
 }
 
+// only draws the stored values, no sensor access
+void read_mpu()
+{
+    if (!mpu_ok)
+    {
+        drawPadded(2, "MPU not found");
+        return;
+    }
+
+    char line[17];
+    snprintf(line, sizeof(line), "AX %6.2f", mpuData.ax);  drawPadded(2, line);
+    snprintf(line, sizeof(line), "AY %6.2f", mpuData.ay);  drawPadded(3, line);
+    snprintf(line, sizeof(line), "AZ %6.2f", mpuData.az);  drawPadded(4, line);
+    snprintf(line, sizeof(line), "GX %6.2f", mpuData.gx);  drawPadded(5, line);
+    snprintf(line, sizeof(line), "GY %6.2f", mpuData.gy);  drawPadded(6, line);
+    snprintf(line, sizeof(line), "GZ %6.2f", mpuData.gz);  drawPadded(7, line);
+}
 /*
 **************************************************************************
 
@@ -470,21 +540,33 @@ State functions
 
 //state to retreive and display the date and time
 void time_state(){
-get_date_time();
+    state_changed();
+    get_date_time();
 }
 
 //function to get and retrieve the current weather conditions
 void weather_state(){
-getWeather();
-}
+    state_changed();
+    // fetch on first visit, then once per interval
+    if (!weatherFetchedOnce || (millis() - lastWeatherFetch >= weatherWait))
+    {
+        weatherFetchedOnce = true;
+        lastWeatherFetch = millis();
 
+        weatherOK = fetch_weather() || weatherOK;      // keep old data if a refresh fails
+        weatherWait = weatherOK ? WEATHER_INTERVAL : WEATHER_RETRY;
+    }
+
+    display_weather();
+}
 
 //function to implement stopwatch 
 void stop_watch_state(){
-timer();
+    state_changed();
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    timer();
     read_mpu();
 }
-
 
 /*
 *********************************************************************************
@@ -543,6 +625,93 @@ void Low_battery_flash(){
     }else {
         return;
     }
+}
+
+//function for seting up the bluetooth connection to another device 
+void ble_setup()
+{
+    //this sets the name that will appear in scans , change if appropriate 
+    NimBLEDevice::init("ESP32-Watch");
+
+    pServer = NimBLEDevice::createServer(); //creating the server (establishing watch as server)
+    pServer->setCallbacks(new ServerCallbacks()); //allowing connect / disconect events to reach our code 
+
+    //making the service with the associated UUID
+    NimBLEService* pService = pServer->createService(SERVICE_UUID);
+
+    //creating the MPU service, its read and notify only to the phone 
+    pMpuChar = pService->createCharacteristic(
+        MPU_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+    );
+
+    //creating a battery service 
+    pBattChar = pService->createCharacteristic(
+        BATT_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+    );
+
+    // initial value so a READ before the first notify isn't empty
+    uint8_t b = battery_percent();
+    pBattChar->setValue(&b, 1);
+
+    //starting the service 
+    pService->start();
+
+    //broadcasting the watches Bluetooth , this is how the phone can find 
+    //it at any time, UUID allows it to keep track of the watch at any point too 
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    pAdv->addServiceUUID(SERVICE_UUID);
+    pAdv->start();
+}
+
+//sends data over bluetooth 
+void ble_send()
+{
+    if (!bleConnected) return;
+
+    // MPU: 6 x int16 = 12 bytes, at most every 100 ms and only with fresh data
+    if (mpuFresh && millis() - lastMpuSend >= 100)
+    {
+        lastMpuSend = millis();
+        mpuFresh = false;
+
+        //each peice of MPU data is stored as a 16 bit integer 
+        int16_t packet[6] = {
+            (int16_t)(mpuData.ax * 100),
+            (int16_t)(mpuData.ay * 100),
+            (int16_t)(mpuData.az * 100),
+            (int16_t)(mpuData.gx * 100),
+            (int16_t)(mpuData.gy * 100),
+            (int16_t)(mpuData.gz * 100)
+        };
+
+        pMpuChar->setValue((uint8_t*)packet, sizeof(packet));
+        pMpuChar->notify();
+    }
+
+    // Battery: 1 byte percent, every 5 s
+    if (millis() - lastBattSend >= 5000)
+    {
+        lastBattSend = millis();
+
+        uint8_t pct = battery_percent();
+        pBattChar->setValue(&pct, 1);  //only 1 byte for the battery percentage 
+        pBattChar->notify();
+    }
+}
+
+
+//reading the battery voltage for transmission over BLE 
+float read_battery_voltage()
+{
+    float adc = analogRead(battery_pin);
+    return (adc / ADC_range) * ADC_max_voltage * V_divider_factor;
+}
+uint8_t battery_percent()
+{
+    float p = ((read_battery_voltage() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
+    return (uint8_t)constrain(p, 0.0f, 100.0f);
 }
 
 /*
