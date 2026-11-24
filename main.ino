@@ -16,11 +16,14 @@
 
 //MPU-6050
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 
-Adafruit_MPU6050 mpu;
+#include <Adafruit_ADXL345_U.h>     // replaces Adafruit_MPU6050.h
+
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
 bool mpu_ok = false;
+bool mpuFresh = false;          // true when there is a reading not yet sent
+unsigned long lastMpuRead = 0;
 
 //your networks name and password
 const char* ssid = "";
@@ -73,8 +76,8 @@ const int battery_pin = 1;
 float voltage  = 0.0;
 float ADC_value = 0;
 float ADC_max_voltage = 3.3;      //max ADC input voltage 
-float op_voltage = 3.2;         //smallest safe  possible operating voltage 
-float  blackout_voltage = 3.0;  //below this voltage ,  the device should turn off
+float op_voltage = 2.26;         //smallest safe  possible operating voltage 
+float  blackout_voltage = 2.055;  //below this voltage ,  the device should turn off
 int battery_flash_delay = 200;  //delay between LED flashes to indicate LOW battery 
 float  ADC_range = 4095.0f;     //Esp C3 has a 12 bit ADC 
 float V_divider_factor = 73.0f / 50.0f  ;
@@ -88,11 +91,16 @@ unsigned long weatherWait = 0;       // how long to wait before the next fetch
 bool weatherFetchedOnce = false;
 bool weatherOK = false;
 
+char shown[8][17];            // what is currently on each of the 8 rows
+int  last_drawn_state = -1;
+int  lastSecondDrawn  = -1;
+
 //Determines the time between window refreshes 
 //Smaller delay creates smoother windows
 const int Refresh_rate = 2;
 
 //BLE defintions 
+//transmitting on watch 
 #define SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
 #define MPU_UUID     "12345678-1234-5678-1234-56789abcdef2"
 #define BATT_UUID    "12345678-1234-5678-1234-56789abcdef3"
@@ -101,14 +109,37 @@ NimBLEServer*         pServer      = nullptr;
 NimBLECharacteristic* pMpuChar  = nullptr;
 NimBLECharacteristic* pBattChar = nullptr;
 
+//Time service for syncing time between phone and watch 
+//ID for time service 
+#define TIME_UUID "12345678-1234-5678-1234-56789abcdef5"
+
+//points to characteristic 
+NimBLECharacteristic* pTimeChar = nullptr;
+
+volatile bool timeNew = false;       // set by the callback, handled in loop()
+volatile uint32_t timeReceived = 0;  // Unix timestamp (UTC seconds), ie no. of secnonds since UTC 0
+bool timeSynced = false;             // true once the phone has set the clock
+
+
+//weather setup , same procedure as Time but the data format recieved is different 
+#define WEATHER_UUID "12345678-1234-5678-1234-56789abcdef6"
+
+NimBLECharacteristic* pWeatherChar = nullptr;
+
+char weatherBuf[32] = "";          // raw text from the phone
+volatile bool weatherNew = false;  // set by the callback, handled in loop()
+
+bool phoneWeatherOK = false;       // true once the phone has sent valid weather
+unsigned long lastPhoneWeather = 0;
+const unsigned long PHONE_WEATHER_VALID = 2UL * 60UL * 60UL * 1000UL;   // trust phone data for 2 h 
+
+
 unsigned long lastMpuSend  = 0;
 unsigned long lastBattSend = 0;
 
-// latest MPU reading, shared by the screen and BLE
-struct MpuData { float ax, ay, az, gx, gy, gz; };
-MpuData mpuData = {0, 0, 0, 0, 0, 0};
-bool mpuFresh = false;          // true when there is a reading not yet sent
-unsigned long lastMpuRead = 0;
+struct MpuData { float ax, ay, az; };
+MpuData mpuData = {0, 0, 0};
+
 //tells us if a device connected to the wacth 
 volatile bool         bleConnected = false;
 unsigned long         lastBleSend  = 0;
@@ -128,10 +159,50 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 };
 
+//callback for syncing time 
+class TimeCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& info) override {
+        NimBLEAttValue val = pChar->getValue(); //gets the data sent 
+
+        //liminting message size to prevent overflow 
+        char buf[16];
+        size_t n = val.size();
+        if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+        memcpy(buf, val.data(), n);
+        buf[n] = '\0'; //terminating character 
+        //converts the string sent to a number ,base 10, if not a number eg "hell" then it ignores it 
+        unsigned long ts = strtoul(buf, nullptr, 10);
+
+        // sanity check: between Nov 2023 and year 2100
+        //1700000000 = Nov 2023
+        //4102444800 = year 2100 if statement ignores anything outside this range 
+        if (ts > 1700000000UL && ts < 4102444800UL)
+        {
+            //variable to store recevied variable and flag fro indicating somethign was recieved    
+            timeReceived = ts;
+            timeNew = true;
+        }
+    }
+};
+
+//weather callbakc 
+class WeatherCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& info) override {
+        NimBLEAttValue val = pChar->getValue();
+
+        size_t n = val.size();
+        if (n > sizeof(weatherBuf) - 1) n = sizeof(weatherBuf) - 1;
+
+        memcpy(weatherBuf, val.data(), n);
+        weatherBuf[n] = '\0';
+        weatherNew = true;
+    }
+};
+
 
 
 /*
-function declarations
+function protoypes 
 *********************************************************************
 */
 
@@ -155,10 +226,11 @@ void ble_setup();
 void update_mpu();
 float read_battery_voltage();
 uint8_t battery_percent();
+void mpu_init();
+void handle_time_sync();
+void handle_weather_rx();
 
-char shown[8][17];            // what is currently on each of the 8 rows
-int  last_drawn_state = -1;
-int  lastSecondDrawn  = -1;
+
 
 // writes a row padded to 16 chars, and only if the text actually changed
 void drawPadded(uint8_t row, const char *text)
@@ -237,36 +309,22 @@ void setup() {
     u8x8.begin();
     u8x8.setPowerSave(0);
 
-    //MPU-setup 
-    Wire.begin(8, 7);   // SDA = GPIO 8, SCL = GPIO 7
-    mpu_ok = mpu.begin(0x68, &Wire);
+    //ADXL setup 
+    Wire.begin(8, 7);
+    Wire.setClock(100000);
+    Wire.setTimeOut(50);
+    mpu_init();
 
-    if (mpu_ok)
-    {
-        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-}
+    //setting up BLE
+    //set before the wifi connection so that BLE is proiritised  
+    ble_setup();
 
     WiFi.begin(ssid , password);
-
-    unsigned long start = millis();
-
-    while(WiFi.status()!=WL_CONNECTED)
-    {
-        if(millis()-start > 15000)          //exits error code after 15s 
-        {
-            Serial.println("Wifi error!");
-            displayError(error_name , error_definition);
-            break;
-        }
-
-        delay(500);
-    }
-
     configTime(2 * 3600, 0, "pool.ntp.org");   // UTC+2 for South Africa
-    //setting up BLE 
-    ble_setup();
+    //sets a variable TZ thats used to hold my time-zone , 1 = overwrite whats present 
+    setenv("TZ", "SAST-2", 1);   // POSIX format: the sign is inverted, so "-2" means UTC+2
+    tzset();
+
 }
   
 
@@ -275,6 +333,8 @@ void loop() {
 
 update_mpu();
 ble_send();
+handle_time_sync();
+handle_weather_rx();
 
 switch(state_counter)
 {
@@ -304,6 +364,7 @@ delay(Refresh_rate);
 //function to get the  time over wifi and display to the OLED 
 tm get_date_time()
 {
+    //  converts time into minutes and hours 
     if (getLocalTime(&timeinfo) && timeinfo.tm_sec != lastSecondDrawn)
     {
         lastSecondDrawn = timeinfo.tm_sec;
@@ -491,24 +552,40 @@ void timer(){
     }
 }
 
+//MPU initialization 
+void mpu_init()
+{
+    mpu_ok = accel.begin(0x53);
+
+    if (mpu_ok)
+    {
+        accel.setRange(ADXL345_RANGE_4_G);
+        accel.setDataRate(ADXL345_DATARATE_100_HZ);
+    }
+}
 
 //the MPU functino below goes in the stopwatch state
 // reads the sensor into mpuData, called every loop, throttled to 10 Hz
 void update_mpu()
 {
-    if (!mpu_ok) return;
+    // not initialised: retry every 2 s
+    if (!mpu_ok)
+    {
+        if (millis() - lastMpuRead < 2000) return;
+        lastMpuRead = millis();
+        mpu_init();
+        return;
+    }
+
     if (millis() - lastMpuRead < 100) return;
     lastMpuRead = millis();
 
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    sensors_event_t event;
+    accel.getEvent(&event);
 
-    mpuData.ax = a.acceleration.x;
-    mpuData.ay = a.acceleration.y;
-    mpuData.az = a.acceleration.z;
-    mpuData.gx = g.gyro.x;
-    mpuData.gy = g.gyro.y;
-    mpuData.gz = g.gyro.z;
+    mpuData.ax = event.acceleration.x;
+    mpuData.ay = event.acceleration.y;
+    mpuData.az = event.acceleration.z;
     mpuFresh = true;
 }
 
@@ -517,7 +594,7 @@ void read_mpu()
 {
     if (!mpu_ok)
     {
-        drawPadded(2, "MPU not found");
+        drawPadded(2, "Accel not found");
         return;
     }
 
@@ -525,9 +602,6 @@ void read_mpu()
     snprintf(line, sizeof(line), "AX %6.2f", mpuData.ax);  drawPadded(2, line);
     snprintf(line, sizeof(line), "AY %6.2f", mpuData.ay);  drawPadded(3, line);
     snprintf(line, sizeof(line), "AZ %6.2f", mpuData.az);  drawPadded(4, line);
-    snprintf(line, sizeof(line), "GX %6.2f", mpuData.gx);  drawPadded(5, line);
-    snprintf(line, sizeof(line), "GY %6.2f", mpuData.gy);  drawPadded(6, line);
-    snprintf(line, sizeof(line), "GZ %6.2f", mpuData.gz);  drawPadded(7, line);
 }
 /*
 **************************************************************************
@@ -545,16 +619,24 @@ void time_state(){
 }
 
 //function to get and retrieve the current weather conditions
+//prioritises the phone connection 
 void weather_state(){
     state_changed();
-    // fetch on first visit, then once per interval
-    if (!weatherFetchedOnce || (millis() - lastWeatherFetch >= weatherWait))
+
+    // phone data counts as fresh for 2 hours
+    bool phoneFresh = phoneWeatherOK &&
+                      (millis() - lastPhoneWeather < PHONE_WEATHER_VALID);
+
+    // only use WiFi if the phone hasn't supplied recent data
+    if (!phoneFresh &&
+        (!weatherFetchedOnce || (millis() - lastWeatherFetch >= weatherWait)))
     {
         weatherFetchedOnce = true;
         lastWeatherFetch = millis();
 
-        weatherOK = fetch_weather() || weatherOK;      // keep old data if a refresh fails
-        weatherWait = weatherOK ? WEATHER_INTERVAL : WEATHER_RETRY;
+        bool ok = fetch_weather();
+        weatherOK   = ok || weatherOK;               // keep old data if the refresh fails
+        weatherWait = ok ? WEATHER_INTERVAL : WEATHER_RETRY;
     }
 
     display_weather();
@@ -651,6 +733,21 @@ void ble_setup()
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
     );
 
+    //time service is writeable for both types of device write normal and without acnkowlegdment  
+    //
+    pTimeChar = pService->createCharacteristic(
+        TIME_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+    );
+    pTimeChar->setCallbacks(new TimeCallbacks());
+
+    //weather service 
+        pWeatherChar = pService->createCharacteristic(
+        WEATHER_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+    );
+    pWeatherChar->setCallbacks(new WeatherCallbacks());
+
     // initial value so a READ before the first notify isn't empty
     uint8_t b = battery_percent();
     pBattChar->setValue(&b, 1);
@@ -677,13 +774,10 @@ void ble_send()
         mpuFresh = false;
 
         //each peice of MPU data is stored as a 16 bit integer 
-        int16_t packet[6] = {
+        int16_t packet[3] = {
             (int16_t)(mpuData.ax * 100),
             (int16_t)(mpuData.ay * 100),
-            (int16_t)(mpuData.az * 100),
-            (int16_t)(mpuData.gx * 100),
-            (int16_t)(mpuData.gy * 100),
-            (int16_t)(mpuData.gz * 100)
+            (int16_t)(mpuData.az * 100)
         };
 
         pMpuChar->setValue((uint8_t*)packet, sizeof(packet));
@@ -712,6 +806,57 @@ uint8_t battery_percent()
 {
     float p = ((read_battery_voltage() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
     return (uint8_t)constrain(p, 0.0f, 100.0f);
+}
+
+//handles time received 
+void handle_time_sync()
+{
+    if (!timeNew) return;
+    timeNew = false;
+
+    //stucture to hold seconds and micro-seconds but we stick to seconds 
+    struct timeval tv;
+    tv.tv_sec  = timeReceived;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr); //sets the time for the board based on the received data 
+
+    //has the phone set the time before-flag 
+    timeSynced = true;
+    lastSecondDrawn = -1;      // force the clock to redraw immediately
+    Serial.printf("Time set from phone: %lu\n", (unsigned long)timeReceived);
+}
+
+void handle_weather_rx()
+{
+    if (!weatherNew) return;
+    weatherNew = false;
+
+    // parse "temp,humidity,code"
+    char* p;
+    float t = strtof(weatherBuf, &p);
+    if (*p != ',') { Serial.println("Weather: bad format"); return; }
+
+    int h = strtol(p + 1, &p, 10);
+    if (*p != ',') { Serial.println("Weather: bad format"); return; }
+
+    int c = strtol(p + 1, &p, 10);
+
+    // sanity checks
+    if (t < -60 || t > 60 || h < 0 || h > 100 || c < 0 || c > 99)
+    {
+        Serial.println("Weather: values out of range");
+        return;
+    }
+
+    weather.temperature = t;
+    weather.humidity    = h;
+    weather.weatherCode = c;
+
+    weatherOK        = true;
+    phoneWeatherOK   = true;
+    lastPhoneWeather = millis();
+
+    Serial.printf("Weather from phone: %.1f C, %d%%, code %d\n", t, h, c);
 }
 
 /*
