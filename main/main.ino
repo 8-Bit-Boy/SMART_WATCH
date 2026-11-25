@@ -71,18 +71,23 @@ unsigned long elapsedTime = 0;
 bool isRunning = false;
 unsigned long counter = 0;
 
-//battery pins 
+//battery setup
+//battery pin
 const int battery_pin = 1;
-float voltage  = 0.0;
-float ADC_value = 0;
 float ADC_max_voltage = 3.3;      //max ADC input voltage 
-float op_voltage = 2.26;         //smallest safe  possible operating voltage 
-float  blackout_voltage = 2.055;  //below this voltage ,  the device should turn off
-int battery_flash_delay = 200;  //delay between LED flashes to indicate LOW battery 
 float  ADC_range = 4095.0f;     //Esp C3 has a 12 bit ADC 
 float V_divider_factor = 73.0f / 50.0f  ;
-bool batteryLow = false;
 
+#define ENABLE_BATT_LOCKOUT 0             // set to 0 when testing on USB with no battery attached, 1 enables it again
+
+const float LOW_BATT_CUTOFF   = 3.2f;     // below this: lock out
+const float RECOVER_VOLTAGE   = 3.6f;     // above this for a while: restart
+const int   LOW_BATT_COUNT    = 3;        // consecutive low readings before lockout
+const int   RECOVER_COUNT     = 5;        // consecutive good readings (about 10 s) before restart
+unsigned long lastBattCheck   = 0;
+int lowReadings = 0;
+
+//weather setup
 const unsigned long WEATHER_INTERVAL = 60UL * 60UL * 1000UL;   // 1 hour
 const unsigned long WEATHER_RETRY    = 60UL * 1000UL;          // retry after 1 min on failure
 
@@ -250,8 +255,6 @@ void stop_watch_state();
 void weather_state();
 void timer();
 String weatherText(int code);
-float  monitor_battery();
-void Low_battery_flash();
 void read_mpu();
 void drawPadded(uint8_t row, const char *text);
 void clearShown();
@@ -269,6 +272,9 @@ void splash_status(const char *msg);
 void screen_power_manager();
 void draw_notification_indicator();
 void handle_ble_rx();
+void battery_guard();
+void low_battery_lockout();
+
 
 // writes a row padded to 16 chars, and only if the text actually changed
 void drawPadded(uint8_t row, const char *text)
@@ -349,6 +355,12 @@ void setup() {
        u8x8.begin();
     u8x8.setPowerSave(0);
 
+    //if the battery voltage is too low , dont even start 
+    #if ENABLE_BATT_LOCKOUT
+        if (read_battery_voltage() < LOW_BATT_CUTOFF)
+            low_battery_lockout();               // never start the radios on a flat battery
+    #endif
+
     splash_screen();                 // appears immediately on power-up
     splash_status("Starting...");
 
@@ -377,6 +389,7 @@ void setup() {
 void loop() {
   // put your main code here, to run repeatedly:
 
+battery_guard();
 update_mpu();
 ble_send();
 handle_time_sync();
@@ -566,12 +579,9 @@ void display_weather()
 
         drawPadded(4, weatherText(weather.weatherCode).c_str());
     }
-
-    float batt_percent = ((monitor_battery() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
-    batt_percent = constrain(batt_percent, 0.0f, 100.0f);
-
+    //display the batteries percentage in the weather screen , --looks good so might leave it here ?--
     char batt[17];
-    snprintf(batt, sizeof(batt), "Bat %.0f%%", batt_percent);
+    snprintf(batt, sizeof(batt), "Bat %d%%", battery_percent());
     drawPadded(6, batt);
 }
 
@@ -703,59 +713,6 @@ Power management functions functions
 */
 
 
-
-float monitor_battery(){
-    //read voltage of the battery 
-    ADC_value = analogRead(battery_pin);
-    //convert to voltage 
-    ::voltage = ((ADC_value/ADC_range)*(ADC_max_voltage))*V_divider_factor;
-
-    if(voltage >= op_voltage){
-        u8x8.setPowerSave(0);
-        return voltage;
-        
-    }else if(voltage > blackout_voltage) {
-
-        //flash LED to indicate reduced battery voltage 
-        Low_battery_flash();
-        ::batteryLow = true;
-        return voltage;
-
-    }else {
-        u8x8.clearDisplay();
-        u8x8.drawString(0, 3, "LOW BATTERY");
-
-        delay(3000);
-
-        u8x8.setPowerSave(1);
-
-        // Sleep until the user charges the watch or presses a button
-        // esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 1);
-        // esp_deep_sleep_start();
-        return voltage;
-    }
-}
-
-void Low_battery_flash(){
-    if(batteryLow){
-    //flash the LED 
-    digitalWrite(BUILTIN_LED, HIGH); 
-    delay(battery_flash_delay);
-
-    digitalWrite(BUILTIN_LED, LOW); 
-    delay(battery_flash_delay);
-    
-    digitalWrite(BUILTIN_LED, HIGH); 
-    delay(battery_flash_delay);
-    
-    digitalWrite(BUILTIN_LED, LOW); 
-    delay(battery_flash_delay);
-    
-    }else {
-        return;
-    }
-}
-
 //function for seting up the bluetooth connection to another device 
 void ble_setup()
 {
@@ -849,18 +806,6 @@ void ble_send()
     }
 }
 
-
-//reading the battery voltage for transmission over BLE 
-float read_battery_voltage()
-{
-    float adc = analogRead(battery_pin);
-    return (adc / ADC_range) * ADC_max_voltage * V_divider_factor;
-}
-uint8_t battery_percent()
-{
-    float p = ((read_battery_voltage() - blackout_voltage) / (3.7f - blackout_voltage)) * 100.0f;
-    return (uint8_t)constrain(p, 0.0f, 100.0f);
-}
 
 //handles time received 
 void handle_time_sync()
@@ -985,6 +930,86 @@ void draw_notification_indicator()
         u8x8.drawTile(col, 0, 1, gamma_tile);
         u8x8.drawString(col + 1, 0, txt);
     }
+}
+
+//improved reading using the millivolts versoin of analogRead
+float read_battery_voltage()
+{
+    long sum = 0;
+    for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(battery_pin);
+    float pin_volts = (sum / 16.0f) / 1000.0f;
+    return pin_volts * V_divider_factor;       // 73/50: back to the real battery voltage
+}
+
+
+//gives the battery percentage , using 3.3V as 0% and 3.7 as 100%
+uint8_t battery_percent()
+{
+    float p = ((read_battery_voltage() - LOW_BATT_CUTOFF) / (3.7f - LOW_BATT_CUTOFF)) * 100.0f;
+    return (uint8_t)constrain(p, 0.0f, 100.0f);
+}
+
+
+//disables the watches functions BLE and wifi until watch is charged 
+void low_battery_lockout()
+{
+    // everything that draws power goes off
+    NimBLEDevice::deinit(true);  //BLE off
+    WiFi.disconnect(true);   //wifi goes off 
+    WiFi.mode(WIFI_OFF);
+    detachInterrupt(state_button);  //remove button interrupts 
+    detachInterrupt(select_button);
+    Wire.end();                     //no SPI
+    setCpuFrequencyMhz(80);         //slow the system clock down all to reduce I-draw 
+
+    // the only things left running: the message and the LED
+    u8x8.setPowerSave(0);
+    u8x8.clearDisplay();
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.drawString(2, 3, "LOW BATTERY");
+    u8x8.drawString(1, 5, "Please charge");
+
+    pinMode(LED_BUILTIN, OUTPUT);
+    int goodReadings = 0;
+
+    while (true)
+    {
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(200);
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(1800);                          // one short flash every 2 s
+
+        // has it been charged? needs a sustained good reading, not one spike
+        if (read_battery_voltage() > RECOVER_VOLTAGE)
+        {
+            if (++goodReadings >= RECOVER_COUNT)
+                ESP.restart();                // reboots straight into normal operation
+        }
+        else
+        {
+            goodReadings = 0;
+        }
+    }
+}
+
+
+//decides when to lock the device based on the battery voltage 
+void battery_guard()
+{
+#if ENABLE_BATT_LOCKOUT
+    if (millis() - lastBattCheck < 1000) return;      // once a second
+    lastBattCheck = millis();
+
+    if (read_battery_voltage() < LOW_BATT_CUTOFF)
+    {
+        if (++lowReadings >= LOW_BATT_COUNT)
+            low_battery_lockout();
+    }
+    else
+    {
+        lowReadings = 0;
+    }
+#endif
 }
 
 /*
