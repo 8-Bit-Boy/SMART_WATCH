@@ -10,6 +10,7 @@
       "supportsTablet": true
     },
     "android": {
+      "allowBackup": false,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -27,13 +28,8 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      [
-        "react-native-ble-plx",
-        {
-          "isBackgroundEnabled": false,
-          "bluetoothAlwaysPermission": "Allow $(PRODUCT_NAME) to connect to your watch"
-        }
-      ]
+      ["react-native-ble-plx", { "isBackgroundEnabled": false, "bluetoothAlwaysPermission": "Allow $(PRODUCT_NAME) to connect to your watch" }],
+      "./plugins/withNotificationListener"
     ],
     "extra": {
       "eas": {
