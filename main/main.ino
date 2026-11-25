@@ -155,6 +155,19 @@ unsigned long         lastBleSend  = 0;
 //counter is a variable used in testing, remove for final run
 uint32_t              bleCounter   = 0;
 
+//Gloabals for inactivity detection and screen control
+volatile unsigned long lastActivity = 0;               // updated by the state button
+const unsigned long SCREEN_TIMEOUT = 60UL * 1000UL;    // 1 minute
+volatile bool screenOn = true;
+
+//globals for displaying notifications in RH corner 
+volatile int notifCount = 0;       // unseen notifications
+int lastDrawnCount = -1;           // what the corner currently shows (-1 = force redraw)
+
+// 8x8 lowercase gamma: each byte is one pixel column, lowest bit at the top
+//chose gamma just cause , change it to whatever u like 
+uint8_t gamma_tile[8] = {0x02, 0x04, 0x08, 0xF0, 0x08, 0x04, 0x02, 0x00};
+
 //class with functions that decide what to do when a device connects or disconnects 
 //overide tells the compiler that we will be changing the libraries defualt version
 //of that function 
@@ -251,12 +264,16 @@ uint8_t battery_percent();
 void mpu_init();
 void handle_time_sync();
 void handle_weather_rx();
-
-
+void splash_screen();
+void splash_status(const char *msg);
+void screen_power_manager();
+void draw_notification_indicator();
+void handle_ble_rx();
 
 // writes a row padded to 16 chars, and only if the text actually changed
 void drawPadded(uint8_t row, const char *text)
 {
+    int width = (row == 0) ? 12 : 16;    // keep cols 12-15 of row 0 free
     char buf[17];
     snprintf(buf, sizeof(buf), "%-16s", text);
 
@@ -281,6 +298,7 @@ void state_changed()
     lastSecondDrawn  = -1;      // force the clock to redraw
     u8x8.clearDisplay();
     clearShown();
+    lastDrawnCount = -1;     // the screen was wiped, so redraw the corner
 }
 
 /*
@@ -290,15 +308,15 @@ ISR's
 
 //state_button ISR
 //triggered when user decides to move from one state 
-//another 
+//another and also triggers the screen to turn back on 
 void IRAM_ATTR state_select(){
-    state_counter++;
+    lastActivity = millis();      // counts time since last button press
+    if (screenOn) notifCount = 0;     // you've seen the screen, so clear it
 
+    state_counter++;
     if(state_counter > max_no_of_states)
         state_counter = 0;
 
-    //clear flags when transitioning states 
-    //for the alarm state
     isRunning  = false;
     selected  = false;
 }
@@ -328,25 +346,31 @@ void setup() {
     pinMode(select_button  , INPUT_PULLUP);
     attachInterrupt(select_button   , option_select, RISING);
     
-    u8x8.begin();
+       u8x8.begin();
     u8x8.setPowerSave(0);
 
-    //ADXL setup 
+    splash_screen();                 // appears immediately on power-up
+    splash_status("Starting...");
+
+    //ADXL setup
+    splash_status("Sensor...");
     Wire.begin(8, 7);
     Wire.setClock(100000);
     Wire.setTimeOut(50);
     mpu_init();
 
     //setting up BLE
-    //set before the wifi connection so that BLE is proiritised  
+    splash_status("Bluetooth...");
     ble_setup();
 
     WiFi.begin(ssid , password);
-    configTime(2 * 3600, 0, "pool.ntp.org");   // UTC+2 for South Africa
-    //sets a variable TZ thats used to hold my time-zone , 1 = overwrite whats present 
-    setenv("TZ", "SAST-2", 1);   // POSIX format: the sign is inverted, so "-2" means UTC+2
+    configTime(2 * 3600, 0, "pool.ntp.org");
+    setenv("TZ", "SAST-2", 1);
     tzset();
 
+    splash_status("Ready");
+    delay(3000);                     // hold the splash so it's readable
+    lastActivity = millis();        
 }
   
 
@@ -359,20 +383,17 @@ handle_time_sync();
 handle_weather_rx();
 handle_ble_rx();
 
-switch(state_counter)
+screen_power_manager();
+
+if (screenOn)
 {
-    case 0:
-        time_state();
-        break;
-
-    case 1:
-        weather_state();
-        break;
-
-
-    case 2:
-        stop_watch_state();
-        break;
+    switch(state_counter)
+    {
+        case 0: time_state();       break;
+        case 1: weather_state();    break;
+        case 2: stop_watch_state(); break;
+    }
+    draw_notification_indicator();
 }
 
 delay(Refresh_rate);
@@ -387,23 +408,26 @@ delay(Refresh_rate);
 //function to get the  time over wifi and display to the OLED 
 tm get_date_time()
 {
-    //  converts time into minutes and hours 
-    if (getLocalTime(&timeinfo) && timeinfo.tm_sec != lastSecondDrawn)
+    if (getLocalTime(&timeinfo, 50) && timeinfo.tm_sec != lastSecondDrawn)
     {
         lastSecondDrawn = timeinfo.tm_sec;
 
-        char timeString[9];
+        char hm[6];            // HH:MM
+        char ss[3];            // SS
         char dateString[20];
 
-        sprintf(timeString, "%02d:%02d:%02d",
-                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        snprintf(hm, sizeof(hm), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+        snprintf(ss, sizeof(ss), "%02d", timeinfo.tm_sec);
         strftime(dateString, sizeof(dateString), "%a %d %b", &timeinfo);
 
+        // large HH:MM on rows 1-4, centred
         u8x8.setFont(u8x8_font_inr21_2x4_r);
-        u8x8.drawString(1, 0, timeString);
+        u8x8.drawString(3, 1, hm);
 
+        // seconds on row 5, date on row 7, small font
         u8x8.setFont(u8x8_font_chroma48medium8_r);
-        u8x8.drawString(2, 6, dateString);
+        u8x8.drawString(7, 5, ss);
+        u8x8.drawString(3, 7, dateString);
     }
 
     return timeinfo;
@@ -856,6 +880,7 @@ void handle_time_sync()
     Serial.printf("Time set from phone: %lu\n", (unsigned long)timeReceived);
 }
 
+//receives wether data 
 void handle_weather_rx()
 {
     if (!weatherNew) return;
@@ -889,17 +914,77 @@ void handle_weather_rx()
     Serial.printf("Weather from phone: %.1f C, %d%%, code %d\n", t, h, c);
 }
 
+//receives notifications and increment 
 void handle_ble_rx()
 {
-    if (rxNew)
-    {
-        rxNew = false;
-        Serial.printf("BLE RX: %s\n", rxBuffer);
-    }
+    if (!rxNew) return;
+    rxNew = false;
 
-    // show the last message on row 7 (unused by every screen)
-    if (rxBuffer[0] != '\0')
-        drawPadded(7, rxBuffer);
+    notifCount++;
+    lastActivity = millis(); //alllows for notification to wake screen , does cost battery life a bit though so up to u 
+    Serial.printf("BLE RX: %s (unseen: %d)\n", rxBuffer, (int)notifCount); //printing no of notifications to serial 
+}
+
+//adding start sreen and progress text along screens so we know where 
+//we are when the watch is turned on 
+// shows the watch name, then a status line that setup() updates
+void splash_screen()
+{
+    u8x8.clearDisplay();
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+
+    u8x8.draw2x2String(3, 1, "Gracy");   // 5 chars = 10 tiles, centred at col 3
+    u8x8.draw2x2String(3, 3, "Tereze");
+}
+
+// overwrites the bottom row with a status message
+void splash_status(const char *msg)
+{
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%-16s", msg);   // pad so old text is wiped
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.drawString(0, 7, buf);
+}
+
+//controls when the screen should be on and off based on its time on  
+void screen_power_manager()
+{
+    //has a minute passed yet , if no then the screen should be on 
+    bool shouldBeOn = (millis() - lastActivity < SCREEN_TIMEOUT);
+
+    if (!shouldBeOn && screenOn) //if the screen should be off 
+    {
+        u8x8.setPowerSave(1);       // display off
+        screenOn = false;           
+    }
+    else if (shouldBeOn && !screenOn)
+    {
+        u8x8.setPowerSave(0);       // display on
+        screenOn = true;
+        last_drawn_state = -1;      // force a full clear and redraw
+    }
+}
+
+//displays the notification symbol and the number of notifications 
+//gets capped at 99 notifications 
+void draw_notification_indicator()
+{
+    int n = notifCount;
+    if (n == lastDrawnCount) return;      // nothing changed, skip the SPI traffic
+    lastDrawnCount = n;
+
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.drawString(12, 0, "    ");       // wipe cols 12-15
+
+    if (n > 0)
+    {
+        char txt[5];
+        snprintf(txt, sizeof(txt), "+%d", n > 99 ? 99 : n);
+
+        int col = 16 - (int)strlen(txt) - 1;     // right-aligned: gamma + text
+        u8x8.drawTile(col, 0, 1, gamma_tile);
+        u8x8.drawString(col + 1, 0, txt);
+    }
 }
 
 /*
