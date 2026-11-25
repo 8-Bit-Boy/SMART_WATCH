@@ -67,8 +67,10 @@ struct tm timeinfo;
 
 // Stopwatch variables
 unsigned long startTime = 0;
-unsigned long elapsedTime = 0;
-bool isRunning = false;
+enum StopwatchState { SW_IDLE, SW_RUNNING, SW_STOPPED };
+StopwatchState swState = SW_IDLE;
+
+volatile bool swReset = false;      // set when you change screens
 unsigned long counter = 0;
 
 //battery setup
@@ -316,21 +318,22 @@ ISR's
 //triggered when user decides to move from one state 
 //another and also triggers the screen to turn back on 
 void IRAM_ATTR state_select(){
-    lastActivity = millis();      // counts time since last button press
-    if (screenOn) notifCount = 0;     // you've seen the screen, so clear it
+    lastActivity = millis();
+    if (screenOn) notifCount = 0;
 
     state_counter++;
     if(state_counter > max_no_of_states)
         state_counter = 0;
 
-    isRunning  = false;
-    selected  = false;
+    swReset  = true;                // leaving the screen resets the stopwatch
+    selected = false;
 }
 
 //select button ISR 
 //triggered when an menu option is selected 
 void IRAM_ATTR option_select(){
-  selected = true;          
+    lastActivity = millis();        // a press also keeps the screen awake
+    selected = true;
 }
 
 /*
@@ -586,27 +589,37 @@ void display_weather()
 }
 
 
-void timer(){
+void timer()
+{
     char buf[17];
 
-    if (selected && !isRunning){
-        isRunning = true;
-        startTime = millis();
-        selected  = false;
+    // leaving the screen resets the stopwatch
+    if (swReset) { swReset = false; swState = SW_IDLE; selected = false; }
+
+    if (selected)
+    {
+        selected = false;
+        switch (swState)
+        {
+            case SW_IDLE:                       // press 1: start
+                swState = SW_RUNNING;
+                startTime = millis();
+                break;
+            case SW_RUNNING:                    // press 2: stop
+                counter = (millis() - startTime) / 1000;
+                swState = SW_STOPPED;
+                break;
+            case SW_STOPPED:                    // press 3: reset to zero
+                swState = SW_IDLE;
+                break;
+        }
     }
-    else if (!selected && isRunning){
-        counter = (millis() - startTime) / 1000;     // seconds since start
-        snprintf(buf, sizeof(buf), "%lu s", counter);
-        drawPadded(0, buf);
-    }
-    else if (selected && isRunning){
-        // stopped: keep showing the last value
-        snprintf(buf, sizeof(buf), "%lu s", counter);
-        drawPadded(0, buf);
-    }
-    else{
-        drawPadded(0, "0 s");
-    }
+
+    if (swState == SW_RUNNING)
+        counter = (millis() - startTime) / 1000;
+
+    snprintf(buf, sizeof(buf), "%lu s", swState == SW_IDLE ? 0UL : counter);
+    drawPadded(0, buf);
 }
 
 //MPU initialization 
