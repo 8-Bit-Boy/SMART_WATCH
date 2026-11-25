@@ -1,7 +1,7 @@
+import { useEffect, useRef, useState } from 'react';
 import { View, Text, Button, StyleSheet, PermissionsAndroid, Platform } from 'react-native';
 import { BleManager } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
-import { useState, useRef, useEffect } from 'react';
 import RNAndroidNotificationListener from 'react-native-android-notification-listener';
 import { onNotification } from './notifications';
 
@@ -11,6 +11,10 @@ const BATT    = '12345678-1234-5678-1234-56789abcdef3';
 const RX      = '12345678-1234-5678-1234-56789abcdef4';
 const TIME    = '12345678-1234-5678-1234-56789abcdef5';
 const WEATHER = '12345678-1234-5678-1234-56789abcdef6';
+
+// reconnect timing
+const RETRY_MS = 10 * 1000;   // try again every 10 s
+const SCAN_MS  = 5 * 1000;    // each attempt scans for 5 s
 
 // Pretoria; change these if you move
 const LATITUDE  = -25.7545;
@@ -41,13 +45,13 @@ async function requestPermissions() {
 // The watch only has text for some weather codes, so map the others
 // onto the closest one it knows (otherwise it would show "Unknown")
 function toWatchCode(code) {
-  if ([56, 57].includes(code)) return 51;            // freezing drizzle -> drizzle
-  if ([66, 67].includes(code)) return 61;            // freezing rain -> rain
-  if (code === 80) return 61;                        // showers -> rain
+  if ([56, 57].includes(code)) return 51;
+  if ([66, 67].includes(code)) return 61;
+  if (code === 80) return 61;
   if (code === 81) return 63;
   if (code === 82) return 65;
-  if (code === 77 || code === 85 || code === 86) return 71;   // snow grains/showers -> snow
-  if (code === 96 || code === 99) return 95;         // thunderstorm with hail -> storm
+  if (code === 77 || code === 85 || code === 86) return 71;
+  if (code === 96 || code === 99) return 95;
   return code;
 }
 
@@ -64,27 +68,16 @@ async function fetchWeather() {
 }
 
 export default function App() {
-  const [status, setStatus] = useState('Not connected');
+  const [status, setStatus] = useState('Starting...');
   const [accel, setAccel] = useState({ x: 0, y: 0, z: 0 });
   const [battery, setBattery] = useState(null);
   const [weather, setWeather] = useState(null);
-  const deviceRef = useRef(null);
+
+  const deviceRef = useRef(null);       // the connected watch, or null
+  const busyRef = useRef(false);        // true while scanning or connecting
+  const permsRef = useRef(false);       // permissions already granted?
+  const scanTimeout = useRef(null);
   const weatherTimer = useRef(null);
-
-    useEffect(() => {
-    // ask for notification access (opens the system settings page)
-    (async () => {
-      const s = await RNAndroidNotificationListener.getPermissionStatus();
-      if (s !== 'authorized') RNAndroidNotificationListener.requestPermission();
-    })();
-
-    // forward each notification to the watch
-    return onNotification((n) => {
-      if (!deviceRef.current) return;                    // watch not connected
-      const text = String(n.title || n.app || 'New').slice(0, 20);   // the watch buffer holds 20 chars
-      writeText(RX, text).catch(() => {});
-    });
-  }, []);
 
   // BLE values travel as base64 strings, so encode text before writing
   const writeText = (uuid, text) =>
@@ -99,7 +92,6 @@ export default function App() {
       setWeather(w);
 
       if (!deviceRef.current) return;
-      // format the watch expects: "temp,humidity,code"
       const payload = `${w.temp.toFixed(1)},${w.humidity},${toWatchCode(w.code)}`;
       await writeText(WEATHER, payload);
     } catch (e) {
@@ -107,15 +99,35 @@ export default function App() {
     }
   };
 
-  const connect = async () => {
-    if (!(await requestPermissions())) {
-      setStatus('Permissions denied');
-      return;
+  // one scan-and-connect attempt; safe to call as often as you like
+  const attemptConnect = async () => {
+    if (deviceRef.current || busyRef.current) return;   // already connected or mid-attempt
+    busyRef.current = true;
+
+    if (!permsRef.current) {
+      permsRef.current = await requestPermissions();
+      if (!permsRef.current) {
+        busyRef.current = false;
+        setStatus('Permissions denied');
+        return;
+      }
     }
+
     setStatus('Scanning...');
+    let found = false;
 
     manager.startDeviceScan([SERVICE], null, async (error, device) => {
-      if (error) { setStatus(error.message); return; }
+      if (error) {
+        clearTimeout(scanTimeout.current);
+        manager.stopDeviceScan();
+        busyRef.current = false;
+        setStatus('Scan error: ' + error.message + ' (retrying)');
+        return;
+      }
+
+      if (found) return;          // the scan can report the same watch twice
+      found = true;
+      clearTimeout(scanTimeout.current);
       manager.stopDeviceScan();
 
       try {
@@ -128,7 +140,7 @@ export default function App() {
         d.onDisconnected(() => {
           deviceRef.current = null;
           clearInterval(weatherTimer.current);
-          setStatus('Disconnected');
+          setStatus('Disconnected, retrying...');
         });
 
         // sync the clock on every connection
@@ -156,10 +168,46 @@ export default function App() {
           setBattery(Buffer.from(c.value, 'base64').readUInt8(0));
         });
       } catch (e) {
-        setStatus('Error: ' + e.message);
+        setStatus('Connect failed, retrying...');
+        try { await device.cancelConnection(); } catch (_) {}
+      } finally {
+        busyRef.current = false;
       }
     });
+
+    // no watch found within SCAN_MS: stop and wait for the next retry
+    scanTimeout.current = setTimeout(() => {
+      manager.stopDeviceScan();
+      busyRef.current = false;
+      setStatus('Watch not found, retrying...');
+    }, SCAN_MS);
   };
+
+  // try on launch, then every RETRY_MS (does nothing while connected)
+  useEffect(() => {
+    attemptConnect();
+    const retry = setInterval(attemptConnect, RETRY_MS);
+    return () => {
+      clearInterval(retry);
+      clearTimeout(scanTimeout.current);
+      clearInterval(weatherTimer.current);
+      manager.stopDeviceScan();
+    };
+  }, []);
+
+  // notifications: ask for access, then forward each one to the watch
+  useEffect(() => {
+    (async () => {
+      const s = await RNAndroidNotificationListener.getPermissionStatus();
+      if (s !== 'authorized') RNAndroidNotificationListener.requestPermission();
+    })();
+
+    return onNotification((n) => {
+      if (!deviceRef.current) return;                              // watch not connected
+      const text = String(n.title || n.app || 'New').slice(0, 20); // watch buffer holds 20 chars
+      writeText(RX, text).catch(() => {});
+    });
+  }, []);
 
   const send = (uuid, text) => {
     if (deviceRef.current) writeText(uuid, text).catch((e) => setStatus(e.message));
@@ -168,7 +216,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       <Text style={styles.status}>{status}</Text>
-      <Button title="Connect to watch" onPress={connect} />
+      <Button title="Connect now" onPress={attemptConnect} />
 
       <Text style={styles.text}>Battery: {battery ?? '--'} %</Text>
       <Text style={styles.text}>AX {accel.x.toFixed(2)}</Text>
