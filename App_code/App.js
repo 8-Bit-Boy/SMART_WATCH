@@ -4,6 +4,7 @@ import { BleManager } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
 import RNAndroidNotificationListener from 'react-native-android-notification-listener';
 import { onNotification } from './notifications';
+import * as Location from 'expo-location';
 
 const SERVICE = '12345678-1234-5678-1234-56789abcdef0';
 const MPU     = '12345678-1234-5678-1234-56789abcdef2';
@@ -15,17 +16,21 @@ const WEATHER = '12345678-1234-5678-1234-56789abcdef6';
 // reconnect timing
 const RETRY_MS = 10 * 1000;   // try again every 10 s
 const SCAN_MS  = 5 * 1000;    // each attempt scans for 5 s
-
-// Pretoria; change these if you move
-const LATITUDE  = -25.7545;
-const LONGITUDE = 28.2314;
 const WEATHER_REFRESH_MS = 60 * 60 * 1000;   // 1 hour
 
-const WEATHER_URL =
-  `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
+
+// used only if the phone's location can't be read and nothing is cached
+const DEFAULT_LOCATION = { lat: -25.7545, lon: 28.2314 };   // Pretoria
+//cape town location , for testing. Uncomment for final run
+// const DEFAULT_LOCATION = { lat: -33.9249, lon: 18.4241 };   // Cape Town (test only)
+
+const weatherUrl = (lat, lon) =>
+  `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
   `&current=temperature_2m,relative_humidity_2m,weather_code`;
 
+
 const manager = new BleManager();
+
 
 async function requestPermissions() {
   if (Platform.OS !== 'android') return true;
@@ -55,8 +60,17 @@ function toWatchCode(code) {
   return code;
 }
 
-async function fetchWeather() {
-  const res = await fetch(WEATHER_URL);
+async function getPhoneLocation() {
+  const perm = await Location.requestForegroundPermissionsAsync();
+  if (perm.status !== 'granted') throw new Error('Location permission denied');
+
+  // Low accuracy (about city level) is plenty for weather and uses much less battery
+  const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low });
+  return { lat: pos.coords.latitude, lon: pos.coords.longitude };
+}
+
+async function fetchWeather(lat, lon) {
+  const res = await fetch(weatherUrl(lat, lon));
   if (!res.ok) throw new Error('Weather HTTP ' + res.status);
   const json = await res.json();
   const c = json.current;
@@ -72,7 +86,9 @@ export default function App() {
   const [accel, setAccel] = useState({ x: 0, y: 0, z: 0 });
   const [battery, setBattery] = useState(null);
   const [weather, setWeather] = useState(null);
+  const [location, setLocation] = useState(null);
 
+  const lastLocRef = useRef(null);        // last location that worked
   const deviceRef = useRef(null);       // the connected watch, or null
   const busyRef = useRef(false);        // true while scanning or connecting
   const permsRef = useRef(false);       // permissions already granted?
@@ -88,9 +104,21 @@ export default function App() {
   // fetch real weather, show it in the app, and send it to the watch
   const sendWeather = async () => {
     try {
-      const w = await fetchWeather();
+      // 1. where is the phone now? fall back to the last good fix, then the default
+      let loc = lastLocRef.current ?? DEFAULT_LOCATION;
+      try {
+        loc = await getPhoneLocation();
+        lastLocRef.current = loc;
+      } catch (e) {
+        setStatus('Location unavailable, using ' + (lastLocRef.current ? 'last known' : 'default'));
+      }
+      setLocation(loc);
+
+      // 2. weather for that spot
+      const w = await fetchWeather(loc.lat, loc.lon);
       setWeather(w);
 
+      // 3. send it to the watch
       if (!deviceRef.current) return;
       const payload = `${w.temp.toFixed(1)},${w.humidity},${toWatchCode(w.code)}`;
       await writeText(WEATHER, payload);
@@ -137,11 +165,11 @@ export default function App() {
         deviceRef.current = d;
         setStatus('Connected');
 
-        d.onDisconnected(() => {
-          deviceRef.current = null;
-          clearInterval(weatherTimer.current);
-          setStatus('Disconnected, retrying...');
-        });
+      d.onDisconnected((err) => {
+        deviceRef.current = null;
+        clearInterval(weatherTimer.current);
+        setStatus('Disconnected' + (err ? ': ' + err.message : '') + ', retrying...');
+      });
 
         // sync the clock on every connection
         await writeText(TIME, String(Math.floor(Date.now() / 1000)));
@@ -168,7 +196,7 @@ export default function App() {
           setBattery(Buffer.from(c.value, 'base64').readUInt8(0));
         });
       } catch (e) {
-        setStatus('Connect failed, retrying...');
+        setStatus('Connect failed: ' + e.message);
         try { await device.cancelConnection(); } catch (_) {}
       } finally {
         busyRef.current = false;
@@ -225,6 +253,10 @@ export default function App() {
 
       <Text style={styles.text}>
         Weather: {weather ? `${weather.temp.toFixed(1)} C, ${weather.humidity}%, code ${weather.code}` : '--'}
+      </Text>
+
+      <Text style={styles.text}>
+        Location: {location ? `${location.lat.toFixed(2)}, ${location.lon.toFixed(2)}` : '--'}
       </Text>
 
       <Button title="Send weather now" onPress={sendWeather} />
