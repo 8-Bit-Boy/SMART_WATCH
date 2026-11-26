@@ -181,9 +181,11 @@ uint8_t gamma_tile[8] = {0x02, 0x04, 0x08, 0xF0, 0x08, 0x04, 0x02, 0x00};
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
         bleConnected = true;
+        Serial.println("BLE connected");
     }
     void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
         bleConnected = false;
+        Serial.printf("BLE disconnected, reason %d\n", reason);
         NimBLEDevice::getAdvertising()->start();   // become discoverable again
     }
 };
