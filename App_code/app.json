@@ -30,6 +30,7 @@
     "plugins": [
       ["react-native-ble-plx", { "isBackgroundEnabled": false, "bluetoothAlwaysPermission": "Allow $(PRODUCT_NAME) to connect to your watch" }],
       "./plugins/withNotificationListener",
+      "./plugins/withBackgroundService",
       ["expo-location", { "locationWhenInUsePermission": "Allow $(PRODUCT_NAME) to use your location to fetch local weather for your watch" }]
     ],
     "extra": {
